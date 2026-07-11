@@ -800,338 +800,277 @@ char *strnstr(const char *haystack, const char *needle, size_t len) {
   return NULL;
 }
 
+/*
+ * Ground-up rewrite of the multipart/form-data body parser.
+ *
+ * Design: at every point in time, client->buffer[0..client->ptr) holds bytes
+ * that have been read off the wire but not yet "retired" (accounted for in
+ * client->readlen and discarded from the pending window). Every single byte
+ * that leaves the front of this window - whether it's boundary markup,
+ * header text, or field value content already handed to the callback - goes
+ * through exactly one helper, mp_retire_at(), which shifts the buffer and
+ * credits client->readlen by precisely the number of bytes removed. Nothing
+ * else in this function touches client->readlen. This makes the class of
+ * bug where some byte range gets excluded from - or counted twice toward -
+ * the credit structurally impossible: the credit and the removal always
+ * happen together, for the same amount, in the same call.
+ *
+ * client->substep tracks which of four states we're in:
+ *   MP_BOUNDARY     - buffer[0..) should begin with "--" + boundary,
+ *                      followed by either "\r\n" (more fields follow) or
+ *                      "--\r\n" (end of the multipart body).
+ *   MP_HEADER_NAME  - reading a field's header lines one at a time, still
+ *                      looking for the one carrying name="...".
+ *   MP_HEADER_SKIP  - the field's name has been found and relocated to the
+ *                      front of the buffer (see below); skip any remaining
+ *                      header lines (Content-Type, filename, etc.) until
+ *                      the blank line that ends the header block.
+ *   MP_VALUE        - streaming the field's value. buffer[0..namelen) holds
+ *                      the field name, buffer[namelen] is a NUL sentinel,
+ *                      and buffer[namelen+1..ptr) is value content not yet
+ *                      handed to the callback.
+ *
+ * The field name has to survive across many separate calls to this function
+ * - a field's value can span far more TCP reads than fit in the buffer at
+ * once - and there is nowhere in webserver_t to stash a "current field
+ * name" other than the parse buffer itself. So once name="..." is found,
+ * its text is relocated to buffer position 0 and pinned there (never
+ * touched by any later memmove) until the field's value is fully consumed,
+ * with a NUL sentinel at buffer[namelen] letting later states rediscover
+ * namelen via a plain strlen() instead of needing separate storage for it.
+ */
+
+enum {
+  MP_BOUNDARY = 0,
+  MP_HEADER_NAME,
+  MP_HEADER_SKIP,
+  MP_VALUE,
+};
+
+// Discard `n` bytes starting at buffer offset `from`, shifting whatever
+// follows them down to close the gap, and credit exactly `n` bytes to
+// readlen - the only place byte accounting happens in this parser.
+static void mp_retire_at(struct webserver_t *client, uint16_t from, uint16_t n) {
+  if(n == 0) {
+    return;
+  }
+  memmove(&client->buffer[from], &client->buffer[from + n], client->ptr - (from + n));
+  client->ptr -= n;
+  client->readlen += n;
+}
+
 int http_parse_multipart_body(struct webserver_t *client, unsigned char *buf, uint16_t len) {
-  uint16_t hasread = MIN(WEBSERVER_BUFFER_SIZE-client->ptr, len);
   uint16_t rpos = 0, loop = 1;
 
-  while((rpos < len) || ((loop == 1) && (client->ptr > 0))) {
-    hasread = MIN(WEBSERVER_BUFFER_SIZE-client->ptr, len-rpos);
+  while((rpos < len) || (loop == 1 && client->ptr > 0)) {
+    uint16_t hasread = MIN(WEBSERVER_BUFFER_SIZE - client->ptr, len - rpos);
     memcpy(&client->buffer[client->ptr], &buf[rpos], hasread);
     client->ptr += hasread;
     rpos += hasread;
     loop = 1;
 
     while(loop) {
+      uint16_t blen = strlen(client->data.boundary);
+
       switch(client->substep) {
-        // Boundary
-        case 0: {
-          unsigned char *ptr = strnstr(client->buffer, client->data.boundary, client->ptr);
-          unsigned char *ptr1 = (unsigned char *)memchr(client->buffer, '=', client->ptr);
-          uint16_t pos1 = 0;
-          if(ptr1 != NULL) {
-            pos1 = (ptr1-client->buffer)+1;
-          }
-          if(ptr != NULL) {
-            uint16_t pos = (ptr-client->buffer)+strlen(client->data.boundary);
-            if(pos1 > pos) {
-              /*
-               * Only compensate for the key at the
-               * beginning of the buffer when at least
-               * one key has been encountered. This is
-               * the case when the boundary is placed
-               * after the key.
-               */
-              pos1 = 0;
+        /*
+         * Expect "--" + boundary text at position 0, followed by either
+         * "\r\n" (another field follows) or "--\r\n" (end of body).
+         */
+        case MP_BOUNDARY: {
+          uint16_t prefix = 2 + blen;
+          if(client->ptr < prefix) {
+            if(client->ptr == WEBSERVER_BUFFER_SIZE) {
+              // The boundary text alone doesn't fit in the whole buffer.
+              return -1;
             }
+            loop = 0;
+            break;
+          }
+          if(client->buffer[0] != '-' || client->buffer[1] != '-' ||
+             memcmp(&client->buffer[2], client->data.boundary, blen) != 0) {
+            // What we expected to be a boundary line isn't one.
+            return -1;
+          }
+          if(client->ptr >= (uint16_t)(prefix + 2) &&
+             client->buffer[prefix] == '\r' && client->buffer[prefix+1] == '\n') {
+            mp_retire_at(client, 0, prefix + 2);
+            client->substep = MP_HEADER_NAME;
+            break;
+          }
+          if(client->ptr >= (uint16_t)(prefix + 4) &&
+             client->buffer[prefix] == '-' && client->buffer[prefix+1] == '-' &&
+             client->buffer[prefix+2] == '\r' && client->buffer[prefix+3] == '\n') {
+            mp_retire_at(client, 0, prefix + 4);
+            if(client->data.boundary != NULL) {
+              free(client->data.boundary);
+              client->data.boundary = NULL;
+            }
+            if(client->readlen == client->totallen) {
+              return 0;
+            }
+            // The declared Content-Length disagrees with what the
+            // terminating boundary implies was actually received.
+            return -1;
+          }
+          if(client->ptr < (uint16_t)(prefix + 4)) {
+            if(client->ptr == WEBSERVER_BUFFER_SIZE) {
+              // Boundary text matched, but the buffer is completely full
+              // and we still can't tell mid- from final-boundary.
+              return -1;
+            }
+            loop = 0;
+            break;
+          }
+          // Bytes are present but match neither delimiter shape.
+          return -1;
+        } break;
 
-            if(pos+1 <= client->ptr) {
-              if(client->buffer[pos] == '\r' && client->buffer[pos+1] == '\n') {
-                memmove(&client->buffer[0], &client->buffer[pos+1], client->ptr-(pos+1));
-                client->ptr = client->ptr-(pos+1);
-                client->buffer[client->ptr] = 0;
-                client->readlen += ((pos+1)-pos1);
-                client->substep = 1;
-              }
+        /*
+         * Read one header line at a time (bounded by '\n', tolerating a
+         * missing '\r' so a stray bare-LF can never leave us waiting
+         * forever for a byte that will never arrive), looking for the one
+         * that carries name="...".
+         */
+        case MP_HEADER_NAME: {
+          unsigned char *eol = (unsigned char *)memchr(client->buffer, '\n', client->ptr);
+          if(eol == NULL) {
+            if(client->ptr == WEBSERVER_BUFFER_SIZE) {
+              // A single header line longer than the whole buffer.
+              return -1;
             }
-            if(pos+3 <= client->ptr) {
-              if(client->buffer[pos] == '-' && client->buffer[pos+1] == '-' &&
-                client->buffer[pos+2] == '\r' && client->buffer[pos+3] == '\n') {
-                client->readlen += ((pos+4)-(pos1));
-                if(client->readlen == client->totallen) {
-                  if(client->data.boundary != NULL) {
-                    free(client->data.boundary);
-                    client->data.boundary = NULL;
-                  }
-                  return 0;
-                } else {
-                  // Error, content length does not match end boundary
-                  return -1;
-                }
-              }
-            } else {
-              loop = 0;
+            loop = 0;
+            break;
+          }
+          uint16_t through_eol = (eol - client->buffer) + 1;
+          uint16_t line_len = (eol - client->buffer);
+          if(line_len > 0 && client->buffer[line_len-1] == '\r') {
+            line_len -= 1;
+          }
+          if(line_len == 0) {
+            // Blank line reached before any name="..." header was seen.
+            return -1;
+          }
+          unsigned char *name_kw = strncasestr(client->buffer, "name=\"", line_len);
+          if(name_kw != NULL && (uint16_t)((name_kw - client->buffer) + 6) <= line_len) {
+            uint16_t name_start = (name_kw - client->buffer) + 6;
+            unsigned char *close_quote = (unsigned char *)memchr(&client->buffer[name_start], '"', line_len - name_start);
+            if(close_quote != NULL) {
+              uint16_t namelen = close_quote - &client->buffer[name_start];
+              uint16_t kept = namelen + 1;
+              memmove(&client->buffer[0], &client->buffer[name_start], namelen);
+              client->buffer[namelen] = 0;
+              mp_retire_at(client, kept, through_eol - kept);
+              client->substep = MP_HEADER_SKIP;
+              break;
             }
-          } else if(client->ptr < WEBSERVER_BUFFER_SIZE) {
-            loop = 0;
-          } else {
-            /*
-             * We encountered the boundary delimiter, but
-             * it wasn't the one from this request, but it
-             * was part of the POST body
-             */
-            client->substep = 8;
           }
-          if(client->substep == 0) {
-            loop = 0;
-          }
+          // This line doesn't carry the field name; discard it whole.
+          mp_retire_at(client, 0, through_eol);
         } break;
-        // Content-Disposition
-        case 1: {
-          unsigned char *ptr = strncasestr(client->buffer, "content-disposition:", client->ptr);
-          if(ptr != NULL) {
-            uint16_t pos = (ptr-client->buffer)+strlen("content-disposition:");
-            while(client->buffer[pos++] == ' ');
-            pos--;
-            memmove(&client->buffer[0], &client->buffer[pos], client->ptr-(pos));
-            client->ptr = client->ptr-(pos);
-            client->buffer[client->ptr] = 0;
-            client->readlen += pos;
-            client->substep = 2;
-          } else {
-            loop = 0;
-          }
-        } break;
-        // End of content-disposition
-        case 2: {
-          unsigned char *ptr = (unsigned char *)memchr(client->buffer, ';', client->ptr);
-          if(ptr != NULL) {
-            uint16_t pos = (ptr-client->buffer+1);
-            while(client->buffer[pos++] == ' ');
-            pos--;
-            memmove(&client->buffer[0], &client->buffer[pos], client->ptr-(pos));
-            client->ptr -= pos;
-            client->buffer[client->ptr] = 0;
-            client->readlen += pos;
-            client->substep = 3;
-          } else {
-            loop = 0;
-          }
-        } break;
-        // Name
-        case 3: {
-          unsigned char *ptr = strncasestr(client->buffer, "name=\"", client->ptr);
-          if(ptr != NULL) {
-            uint16_t pos = (ptr-client->buffer)+strlen("name=\"");
-            memmove(&client->buffer[0], &client->buffer[pos], client->ptr-(pos));
-            client->ptr = client->ptr-(pos);
-            client->readlen += pos;
-            client->substep = 6;
-          } else {
-            loop = 0;
-          }
-        } break;
-        // Filename etc.
-        case 4: {
-          unsigned char *ptr = strncasestr(client->buffer, "\";", client->ptr);
-          if(ptr != NULL) {
-            uint16_t pos = (ptr-client->buffer);
-            // First try to find \r\n\r\n (end of all headers)
-            unsigned char *ptr1 = strnstr(&client->buffer[pos], "\r\n\r\n", client->ptr-pos);
-            if(ptr1 != NULL) {
-              // Double CRLF found - skip directly to data
-              client->buffer[pos++] = '=';
-              uint16_t pos1 = (ptr1-client->buffer);
-              uint16_t newlen = client->ptr-((pos1+4)-pos);
-              memmove(&client->buffer[pos], &client->buffer[pos1+4], newlen);
-              client->ptr = newlen;
-              client->readlen += (pos1+4);
-              // Skip case 5 entirely, go straight to data
-              client->substep = 7;
-            } else {
-              // Single \r\n - more headers follow, go to case 5
-              ptr1 = strncasestr(&client->buffer[pos], "\r\n", client->ptr-pos);
-              if(ptr1 != NULL) {
-                if(((ptr1-client->buffer) + 4) >= client->ptr) {
-                  // CRLF on end of buffer, wait for two more to make sure we are not at end of header
-                  loop = 0;
-                } else {
-                  client->buffer[pos++] = '=';
-                  uint16_t pos1 = (ptr1-client->buffer);
-                  uint16_t newlen = client->ptr-((pos1+2)-pos);
-                  memmove(&client->buffer[pos], &client->buffer[pos1+2], newlen);
-                  client->ptr = newlen;
-                  client->readlen += (pos1+2);
-                  client->substep = 5;
-                }
-              } else {
-                client->substep = 6;
-              }
-            }
-          } else {
-            loop = 0;
-          }
-        } break;
-        // Content-type
-        case 5: {
-          unsigned char *ptr = (unsigned char *)memchr(client->buffer, '=', client->ptr);
-          if(ptr != NULL) {
-            uint16_t pos = (ptr-client->buffer)+1;
 
-            if((client->ptr - pos) >= 4) {
-              unsigned char *ptr1 = strnstr(&client->buffer[pos], "\r\n\r\n", client->ptr-pos);
-              if(ptr1 != NULL) {
-                uint16_t pos1 = (ptr1-client->buffer)+4;
-                uint16_t newlen = client->ptr-(pos1-pos);
-                memmove(&client->buffer[pos], &client->buffer[pos1], newlen);
-                client->ptr = newlen;
-                client->readlen += (pos1-pos);
-                client->substep = 7;
-              } else {
-                loop = 0;
-              }
-            } else {
-              loop = 0;
+        /*
+         * The field's name is already pinned at buffer[0..namelen], with a
+         * NUL sentinel at buffer[namelen]. Discard any further header lines
+         * until the blank line that ends the header block.
+         */
+        case MP_HEADER_SKIP: {
+          uint16_t namelen = strlen((char *)client->buffer);
+          uint16_t base = namelen + 1;
+          unsigned char *eol = (unsigned char *)memchr(&client->buffer[base], '\n', client->ptr - base);
+          if(eol == NULL) {
+            if(client->ptr == WEBSERVER_BUFFER_SIZE) {
+              return -1;
             }
-          } else {
             loop = 0;
+            break;
           }
-        } break;
-        // Name
-        case 6: {
-          if(client->ptr >= 2) {
-            unsigned char *ptr = strnstr(client->buffer, "\";", client->ptr);
-            if(ptr != NULL) {
-              unsigned char *ptr1 = strnstr(client->buffer, "\r\n", client->ptr);
-              if(ptr1 != NULL) {
-                client->substep = 4;
-              } else {
-                loop = 0;
-              }
-            } else {
-              unsigned char *ptr1 = strnstr(client->buffer, "\"\r\n", client->ptr);
-              if(ptr1 != NULL) {
-                uint16_t pos = (ptr1-client->buffer);
-                /*
-                 * Since we're increasing the pos
-                 * right after, check for 5 positions
-                 */
-                if((client->ptr - pos) >= 5) {
-                  client->buffer[pos++] = '=';;
-                  unsigned char *ptr2 = strnstr(&client->buffer[pos], "\r\n\r\n", client->ptr-pos);
-                  if(ptr2 != NULL) {
-                    uint16_t pos1 = (ptr2-client->buffer)+4;
-
-                    memmove(&client->buffer[pos], &client->buffer[pos1], client->ptr-pos1);
-                    client->ptr -= (pos1-pos);
-                    client->readlen += pos1;
-                    client->substep = 7;
-                  } else {
-                    loop = 0;
-                  }
-                } else {
-                  loop = 0;
-                }
-              } else {
-                loop = 0;
-              }
-            }
-          } else {
-            loop = 0;
+          uint16_t through_eol = (eol - &client->buffer[base]) + 1;
+          uint16_t line_len = (eol - &client->buffer[base]);
+          if(line_len > 0 && client->buffer[base + line_len - 1] == '\r') {
+            line_len -= 1;
           }
+          if(line_len == 0) {
+            mp_retire_at(client, base, through_eol);
+            client->substep = MP_VALUE;
+            break;
+          }
+          mp_retire_at(client, base, through_eol);
         } break;
-        // Value
-        case 8:
-        case 7: {
-          unsigned char *ptr = strnstr(client->buffer, "\r\n--", client->ptr);
-          if(ptr != NULL && client->substep != 8) {
-            uint16_t pos = (ptr-client->buffer);
 
-            ptr = (unsigned char *)memchr(client->buffer, '=', client->ptr);
-            uint16_t vlen = 0;
+        /*
+         * Stream the field's value. Search for "\r\n--" followed by our
+         * actual boundary text (verified explicitly here, not deferred to
+         * a later state) to find where the value truly ends. If the buffer
+         * fills up before that's found, proactively flush everything except
+         * a safety tail long enough to still contain a terminator sequence
+         * that got split across this buffer-fill.
+         */
+        case MP_VALUE: {
+          uint16_t namelen = strlen((char *)client->buffer);
+          uint16_t base = namelen + 1;
+          uint16_t vlen = client->ptr - base;
+          uint16_t safety_tail = 4 + blen + 4; // "\r\n--" + boundary + "--\r\n"
 
-            if(ptr != NULL) {
-              vlen = (ptr-client->buffer);
-            } else {
-              // error
-              return -1; /*LCOV_EXCL_LINE*/
+          unsigned char *anchor = NULL;
+          uint16_t search_off = 0;
+          while(search_off < vlen) {
+            unsigned char *candidate = (vlen - search_off >= 4) ?
+              strnstr(&client->buffer[base + search_off], "\r\n--", vlen - search_off) : NULL;
+            if(candidate == NULL) {
+              break;
             }
+            uint16_t apos = candidate - client->buffer;
+            uint16_t after = apos + 4;
+            if((uint16_t)(client->ptr - after) < blen) {
+              // Not enough buffered yet to confirm the boundary text.
+              break;
+            }
+            if(memcmp(&client->buffer[after], client->data.boundary, blen) == 0) {
+              anchor = candidate;
+              break;
+            }
+            // A "\r\n--" that isn't followed by our boundary text - part of
+            // the raw value, keep searching past it.
+            search_off = (apos - base) + 1;
+          }
 
+          if(anchor != NULL) {
+            uint16_t m = anchor - &client->buffer[base];
             struct arguments_t args;
-            client->buffer[vlen] = 0;
-
             args.name = &client->buffer[0];
-            args.value = &client->buffer[vlen+1];
-            args.len = pos-(vlen+1);
-
+            args.value = &client->buffer[base];
+            args.len = m;
             if(client->callback != NULL) {
-              uint8_t ret = client->callback(client, &args);
-              if(ret == -1) {
+              if(client->callback(client, &args) == -1) {
                 return -1;
               }
             }
+            mp_retire_at(client, 0, base + m + 2); // name + sentinel + value + CRLF
+            client->substep = MP_BOUNDARY;
+            break;
+          }
 
-            client->buffer[vlen] = '=';
+          if(client->ptr < WEBSERVER_BUFFER_SIZE) {
+            loop = 0;
+            break;
+          }
 
-            memmove(&client->buffer[vlen+1], &client->buffer[pos], client->ptr-pos);
-            client->readlen += (pos-(vlen+1));
-            client->ptr -= (pos-(vlen+1));
-            client->substep = 0;
-          } else if(client->ptr == WEBSERVER_BUFFER_SIZE) {
-            uint8_t ending = 0;
-            uint8_t dash = 0;
-            /*
-             * Double check that the CR / LN don't belong
-             * to the boundary delimiter.
-             */
-            if(strncmp((char *)&client->buffer[client->ptr-1], "\r", 1) == 0) {
-              ending = 1;
-            }
-            if(strncmp((char *)&client->buffer[client->ptr-2], "\r\n", 2) == 0) {
-              ending = 2;
-            }
-            if(strncmp((char *)&client->buffer[client->ptr-3], "\r\n\r", 3) == 0) {
-              ending = 3;
-            }
-            if(strncmp((char *)&client->buffer[client->ptr-3], "\r\n-", 3) == 0) {
-              ending = 3;
-              dash = 1;
-            }
-            if(client->substep == 8) {
-              client->substep = 7;
-            }
-            unsigned char *ptr = (unsigned char *)memchr(client->buffer, '=', client->ptr);
-            if(ptr != NULL) {
-              uint16_t pos = (ptr-client->buffer);
-
-              struct arguments_t args;
-              client->buffer[pos] = 0;
-
-              args.name = &client->buffer[0];
-              args.value = &client->buffer[pos+1];
-              args.len = (WEBSERVER_BUFFER_SIZE-ending)-(pos+1);
-
-              if(client->callback != NULL) {
-                uint8_t ret = client->callback(client, &args);
-                if(ret == -1) {
-                  return -1;
-                }
-              }
-              client->buffer[pos] = '=';
-              if(ending == 1) {
-                client->buffer[pos+1] = '\r';
-              }
-              if(ending == 2) {
-                client->buffer[pos+1] = '\r';
-                client->buffer[pos+2] = '\n';
-              }
-              if(ending == 3) {
-                client->buffer[pos+1] = '\r';
-                client->buffer[pos+2] = '\n';
-                client->buffer[pos+3] = '\r';
-                if(dash) {
-                  client->buffer[pos+3] = '-';
-                }
-              }
-              client->readlen += ((client->ptr-(pos+1))-ending);
-              client->ptr = pos+1+ending;
-              loop = 0;
-            } else {
-              // error
+          if(vlen <= safety_tail) {
+            // Buffer too small to make progress against this boundary length.
+            return -1;
+          }
+          uint16_t flush = vlen - safety_tail;
+          struct arguments_t args;
+          args.name = &client->buffer[0];
+          args.value = &client->buffer[base];
+          args.len = flush;
+          if(client->callback != NULL) {
+            if(client->callback(client, &args) == -1) {
               return -1;
             }
-          } else {
-            loop = 0;
           }
+          mp_retire_at(client, base, flush);
         } break;
       }
     }
@@ -1139,6 +1078,7 @@ int http_parse_multipart_body(struct webserver_t *client, unsigned char *buf, ui
 
   return 0;
 }
+
 
 #ifdef __linux__
 static char *code_to_text(uint16_t code) {
